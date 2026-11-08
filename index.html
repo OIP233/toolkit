@@ -328,6 +328,9 @@ body{font-family:Barlow,system-ui,'Segoe UI',Roboto,sans-serif;background:var(--
 .voice-modal-note{font-size:.85rem;color:var(--text2);font-style:italic;margin-top:1rem}
 .voice-modal-btn{font-family:'Share Tech Mono','Cascadia Mono',Consolas,monospace;font-size:1rem;font-weight:600;padding:.75rem 1.5rem;background:var(--orange);color:var(--bg);border:none;border-radius:8px;cursor:pointer;transition:all var(--transition-med);width:100%;margin-top:1rem}
 .voice-modal-btn:hover{background:#e85a2a;transform:translateY(-2px)}
+a.voice-modal-btn{display:block;text-align:center;text-decoration:none}
+.voice-modal-btn.voice-modal-alt{background:transparent;color:var(--text);border:1px solid var(--border);margin-top:.5rem}
+.voice-modal-btn.voice-modal-alt:hover{background:var(--bg2);transform:none}
 .ex-modal{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.9);z-index:9999;display:flex;align-items:flex-start;justify-content:center;padding:1rem;padding-top:2rem;opacity:1;transition:opacity .3s ease;overflow-y:auto}
 .ex-modal.hidden{opacity:0;pointer-events:none}
 .ex-modal-content{background:var(--card);border:3px solid var(--yellow);border-radius:16px;padding:1.5rem;max-width:500px;width:100%;text-align:center;animation:modalSlideIn .4s ease-out;margin-bottom:2rem}
@@ -4701,8 +4704,94 @@ const voiceSupported = 'webkitSpeechRecognition' in window || 'SpeechRecognition
 let activeRecognition = null;
 let voiceInstructionShown = false;
 
+// Where browser speech recognition cannot work, the mic button explains the alternatives
+// instead of failing silently:
+// - Android WebView (in-app browsers such as LMS apps): the Web Speech API does not work.
+// - Cross-origin iframe without allow="microphone" (LMS embeds): no microphone access.
+const VOICE_ENV = (() => {
+    let framed = false;
+    try { framed = window.self !== window.top } catch (e) { framed = true }
+    const webview = /; wv\)/.test(navigator.userAgent);
+    let micAllowed = true;
+    try {
+        const fp = document.permissionsPolicy || document.featurePolicy;
+        if (fp && typeof fp.allowsFeature === 'function') micAllowed = fp.allowsFeature('microphone');
+    } catch (e) {}
+    return { framed, webview, micAllowed };
+})();
+
+function voiceBlockedReason() {
+    if (VOICE_ENV.webview) return 'webview';
+    if (!voiceSupported) return 'unsupported';
+    if (!VOICE_ENV.micAllowed) return 'frame';
+    return null;
+}
+
+function showVoiceFallback(input, reason) {
+    document.querySelectorAll('.voice-modal').forEach(m => m.remove());
+    const why = {
+        webview: 'This app cannot use speech recognition inside a web page.',
+        frame: 'The learning environment does not give the toolkit access to the microphone.',
+        unsupported: 'This browser does not support speech recognition.',
+        failed: 'Speech recognition could not be started here.'
+    }[reason] || 'Speech recognition could not be started here.';
+    const canOpen = (VOICE_ENV.framed || VOICE_ENV.webview) && /^https?:/.test(location.href);
+    const modal = document.createElement('div');
+    modal.className = 'voice-modal';
+    modal.innerHTML = `
+        <div class="voice-modal-content">
+            <div class="voice-modal-icon">🎤</div>
+            <h3 class="voice-modal-title">Speech input is not available here</h3>
+            <div class="voice-modal-text">
+                <p>${why}</p>
+                <div class="voice-instruction">
+                    <div class="voice-instruction-step">
+                        <span class="voice-step-num">1</span>
+                        <span>Tap the input field, then the microphone key on the keyboard (for example Gboard). This works everywhere.</span>
+                    </div>
+                    ${canOpen ? `<div class="voice-instruction-step">
+                        <span class="voice-step-num">2</span>
+                        <span>Or open the toolkit in Chrome. The speech button works there. Data entered here is not carried over.</span>
+                    </div>` : ''}
+                </div>
+            </div>
+            <button class="voice-modal-btn" data-act="kbd">Use keyboard microphone</button>
+            ${canOpen ? `<a class="voice-modal-btn voice-modal-alt" data-act="open" href="${esc(location.href)}" target="_blank" rel="noopener">Open in browser</a>
+            <button class="voice-modal-btn voice-modal-alt" data-act="copy">Copy link</button>` : ''}
+            <button class="voice-modal-btn voice-modal-alt" data-act="close">Close</button>
+        </div>
+    `;
+    modal.addEventListener('click', e => {
+        const act = e.target.closest('[data-act]')?.dataset.act;
+        if (!act && e.target !== modal) return;
+        if (act === 'copy') {
+            const url = location.href;
+            const done = () => toast('📋 Copied: ' + url);
+            if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(url).then(done, () => prompt('Copy link', url));
+            else prompt('Copy link', url);
+            return;
+        }
+        modal.remove();
+        if (act === 'kbd' && input) {
+            // A number field gets the numeric keypad, which has no microphone key
+            if (input.type === 'number') {
+                input.type = 'text'; input.setAttribute('inputmode', 'text');
+                input.addEventListener('blur', () => {
+                    // Dictation gives "12,5" or "12.5 bar": keep the number, then restore the field
+                    const m = convertSpokenNumbers(input.value).replace(/\s/g, '').replace(',', '.').match(/-?\d+(\.\d+)?/);
+                    input.type = 'number'; input.setAttribute('inputmode', 'decimal');
+                    input.value = m ? m[0] : '';
+                    input.dispatchEvent(new Event('input', { bubbles: true }));
+                }, { once: true });
+            }
+            input.focus();
+        }
+    });
+    document.body.appendChild(modal);
+}
+
 function initVoiceInput() {
-    if (!voiceSupported) {
+    if (!voiceSupported && !VOICE_ENV.webview) {
         console.log('Speech recognition not supported');
         return;
     }
@@ -4771,20 +4860,40 @@ function startVoiceInput(input, btn) {
         return;
     }
     
-    // Show instruction on first use
-    showVoiceInstruction();
-    
+    const blocked = voiceBlockedReason();
+    if (blocked) { showVoiceFallback(input, blocked); return; }
+
+    // Show instruction on first use (address-bar steps only make sense outside a frame)
+    if (!VOICE_ENV.framed) showVoiceInstruction();
+
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    const recognition = new SpeechRecognition();
+    let recognition;
+    try { recognition = new SpeechRecognition(); } catch (e) { showVoiceFallback(input, 'failed'); return; }
     activeRecognition = recognition;
-    
-    recognition.lang = (typeof LOCALE!=='undefined'&&LOCALE[store.get('lang','en')])||'en-GB';
+
+    recognition.lang = (typeof LOCALE!=='undefined'&&LOCALE[typeof LANG!=='undefined'?LANG:'en'])||'en-GB';
     recognition.continuous = false;
     recognition.interimResults = true;
-    
+
     const statusEl = document.getElementById('voice-status-' + input.id);
-    
+    let started = false;
+    const resetBtn = () => {
+        btn.classList.remove('listening');
+        btn.innerHTML = ICONS.mic;
+        if (activeRecognition === recognition) activeRecognition = null;
+    };
+    // Some embedded browsers neither start nor report an error: give up after a while.
+    // Only in embeds/in-app browsers, so a normal permission prompt is never cut short.
+    const watchdog = (VOICE_ENV.framed || VOICE_ENV.webview) ? setTimeout(() => {
+        if (started || activeRecognition !== recognition) return;
+        try { recognition.abort(); } catch (e) {}
+        resetBtn();
+        showVoiceFallback(input, VOICE_ENV.framed ? 'frame' : 'failed');
+    }, 10000) : 0;
+
     recognition.onstart = () => {
+        started = true;
+        clearTimeout(watchdog);
         btn.classList.add('listening');
         btn.innerHTML = ICONS.stopsq;
         if (statusEl) {
@@ -4812,6 +4921,17 @@ function startVoiceInput(input, btn) {
     };
     
     recognition.onerror = (event) => {
+        clearTimeout(watchdog);
+        const wasActive = activeRecognition === recognition;
+        resetBtn();
+        // In an embed or in-app browser, a permission/service error means speech cannot
+        // work here at all: show the alternatives instead of a settings hint.
+        const hard = ['not-allowed', 'service-not-allowed', 'audio-capture'].includes(event.error);
+        if (hard && wasActive && (VOICE_ENV.framed || VOICE_ENV.webview)) {
+            if (statusEl) statusEl.textContent = '';
+            showVoiceFallback(input, VOICE_ENV.framed ? 'frame' : VOICE_ENV.webview ? 'webview' : 'failed');
+            return;
+        }
         let errorMsg = 'Speech recognition error';
         if (event.error === 'no-speech') {
             errorMsg = 'No speech detected';
@@ -4819,25 +4939,27 @@ function startVoiceInput(input, btn) {
             errorMsg = 'Microphone access denied — allow access in browser settings';
         } else if (event.error === 'network') {
             errorMsg = 'Network error - check connection';
+        } else if (event.error === 'aborted') {
+            return;
         }
         if (statusEl) {
             statusEl.textContent = errorMsg;
             statusEl.className = 'voice-status error';
         }
-        btn.classList.remove('listening');
-        btn.innerHTML = ICONS.mic;
-        activeRecognition = null;
     };
-    
+
     recognition.onend = () => {
+        clearTimeout(watchdog);
+        if (!started) { resetBtn(); return; }
         btn.classList.remove('listening');
         btn.classList.add('success');
         btn.innerHTML = ICONS.mic;
         setTimeout(() => btn.classList.remove('success'), 1500);
-        activeRecognition = null;
+        if (activeRecognition === recognition) activeRecognition = null;
     };
-    
-    recognition.start();
+
+    try { recognition.start(); }
+    catch (e) { clearTimeout(watchdog); resetBtn(); showVoiceFallback(input, VOICE_ENV.framed ? 'frame' : 'failed'); }
 }
 
 function convertSpokenNumbers(text) {
@@ -5712,6 +5834,20 @@ const I18N={"nl":{"-- Select topic --":"-- Selecteer onderwerp --","— Crude Oi
 const LANG_URL=(()=>{try{const l=new URLSearchParams(location.search).get('lang');return ['en','nl','de','fr'].includes(l)?l:null}catch(e){return null}})();
 let LANG=LANG_URL||store.get('lang','en');
 const LOCALE={en:'en-GB',nl:'nl-NL',de:'de-DE',fr:'fr-FR'};
+// Speech fallback (embeds and in-app browsers), Nov 2026: [en, nl, de, fr]
+[
+ ['Speech input is not available here','Spraakinvoer werkt hier niet','Spracheingabe ist hier nicht verfügbar',"La saisie vocale n'est pas disponible ici"],
+ ['This app cannot use speech recognition inside a web page.','Deze app kan binnen een webpagina geen spraakherkenning gebruiken.','Diese App kann innerhalb einer Webseite keine Spracherkennung nutzen.','Cette application ne peut pas utiliser la reconnaissance vocale dans une page web.'],
+ ['The learning environment does not give the toolkit access to the microphone.','De leeromgeving geeft de toolkit geen toegang tot de microfoon.','Die Lernumgebung gibt dem Toolkit keinen Zugriff auf das Mikrofon.',"L'environnement d'apprentissage ne donne pas au toolkit l'accès au microphone."],
+ ['This browser does not support speech recognition.','Deze browser ondersteunt geen spraakherkenning.','Dieser Browser unterstützt keine Spracherkennung.','Ce navigateur ne prend pas en charge la reconnaissance vocale.'],
+ ['Speech recognition could not be started here.','Spraakherkenning kon hier niet starten.','Die Spracherkennung konnte hier nicht gestartet werden.',"La reconnaissance vocale n'a pas pu démarrer ici."],
+ ['Tap the input field, then the microphone key on the keyboard (for example Gboard). This works everywhere.','Tik op het invoerveld en daarna op de microfoontoets van het toetsenbord (bijvoorbeeld Gboard). Dat werkt overal.','Auf das Eingabefeld tippen, dann auf die Mikrofontaste der Tastatur (zum Beispiel Gboard). Das funktioniert überall.','Touchez le champ de saisie, puis la touche micro du clavier (par exemple Gboard). Cela fonctionne partout.'],
+ ['Or open the toolkit in Chrome. The speech button works there. Data entered here is not carried over.','Of open de toolkit in Chrome. Daar werkt de spraakknop. Wat hier is ingevuld, gaat niet mee.','Oder das Toolkit in Chrome öffnen. Dort funktioniert die Sprachtaste. Hier eingegebene Daten werden nicht übernommen.','Ou ouvrez le toolkit dans Chrome. Le bouton vocal y fonctionne. Les données saisies ici ne sont pas reprises.'],
+ ['Use keyboard microphone','Microfoon van toetsenbord gebruiken','Tastaturmikrofon verwenden','Utiliser le micro du clavier'],
+ ['Open in browser','Openen in browser','Im Browser öffnen','Ouvrir dans le navigateur'],
+ ['Copy link','Link kopiëren','Link kopieren','Copier le lien'],
+ ['Close','Sluiten','Schließen','Fermer']
+].forEach(([en,nl,de,fr])=>{I18N.nl[en]=nl;I18N.de[en]=de;I18N.fr[en]=fr});
 
 // Parameterized strings (numbers/names inside). $1..$9 = captured groups.
 const I18N_PATTERNS=[
